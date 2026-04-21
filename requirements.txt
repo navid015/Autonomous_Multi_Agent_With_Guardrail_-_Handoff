@@ -1,0 +1,7 @@
+gradio
+openai-agents
+openai
+requests
+python-dotenv
+pydantic
+typing_extensions

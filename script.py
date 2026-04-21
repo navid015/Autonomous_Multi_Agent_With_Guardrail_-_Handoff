@@ -5,6 +5,7 @@ import requests
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from typing_extensions import TypedDict
+from openai.types.responses import ResponseTextDeltaEvent
 
 from agents import (
     Agent,
@@ -18,7 +19,10 @@ from agents import (
     handoff,
     input_guardrail,
 )
+
+
 from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX
+from agents.exceptions import InputGuardrailTripwireTriggered 
 
 
 load_dotenv()
@@ -140,12 +144,6 @@ Output: A concise summary (≤200 words).
 )
 
 
-class FinalReport(BaseModel):
-    short_summary: str
-    markdown_report: str
-    follow_up_questions: list[str]
-
-
 async def extract_summary(run_result: RunResult) -> str:
     return run_result.final_output.summary
 
@@ -153,15 +151,24 @@ async def extract_summary(run_result: RunResult) -> str:
 writer_agent = Agent(
     name="Writer",
     instructions="""Context: You are an expert research writer preparing a comprehensive investment report.
-Instruction: Use the tools to gather up-to-date information, then synthesize it into a cohesive, well-structured markdown report (min 600 words).
-Your report must:
-1) begin with a concise 2–3 sentence executive summary,
-2) include headings and a logical flow,
-3) stay objective and evidence-led,
-4) end with 3–5 specific follow-up research questions.
-""",
+    Instruction: Use the tools to gather up-to-date information, then synthesize it into a cohesive, well-structured markdown report (min 600 words).
+
+    Your output must be pure markdown (no JSON, no code fences around the whole thing) with this exact structure:
+
+    ## Executive Summary
+    (2-3 sentence concise summary)
+
+    ## Full Report
+    (main body with headings, logical flow, objective and evidence-led, min 600 words)
+
+    ## Follow-up Questions
+    - (question 1)
+    - (question 2)
+    - (question 3)
+    (3-5 specific follow-up research questions as a bulleted list)
+    """,
     model=main_model,
-    output_type=FinalReport,
+    # output_type removed — Writer now emits raw markdown
     tools=[
         fundamentals_agent.as_tool(
             "fundamentals",
@@ -209,23 +216,52 @@ planner_with_handoff = planner_agent.clone(
 )
 
 
-async def run_handoffs_demo(user_query: str) -> str:
+async def run_handoffs_demo_stream(user_query: str):
     """
-    Runs the Planner→Writer handoff and returns a Markdown report for UI display.
+    Streams progress + markdown report token-by-token.
     """
-    run_res = await Runner.run(planner_with_handoff, user_query, session=session)
-    report: FinalReport = run_res.final_output
+    try:
+        result = Runner.run_streamed(planner_with_handoff, user_query, session=session)
 
-    followups = "\n".join([f"- {q}" for q in report.follow_up_questions]) if report.follow_up_questions else ""
+        status = "🔍 **Planning research...**\n\n"
+        yield status
 
-    return "\n\n".join(
-        [
-            "## Executive Summary",
-            report.short_summary.strip(),
-            "## Full Report",
-            report.markdown_report.strip(),
-            "## Follow-up Questions",
-            followups,
-        ]
-    ).strip()
+        tool_count = 0
+        writer_active = False
+        report_text = ""
 
+        async for event in result.stream_events():
+            if event.type == "agent_updated_stream_event":
+                if event.new_agent.name == "Writer":
+                    writer_active = True
+                    status = ""  # clear status, report will take over
+                    yield "✍️ **Writing report...**\n\n"
+                else:
+                    status = f"🤖 **{event.new_agent.name}** is working...\n\n"
+                    yield status
+
+            elif event.type == "run_item_stream_event":
+                if event.item.type == "tool_call_item":
+                    tool_count += 1
+                    if not writer_active:
+                        yield status + f"🔧 *Running tool call #{tool_count}...*"
+
+            # Stream markdown tokens only when the Writer is producing the final answer
+            elif event.type == "raw_response_event" and writer_active:
+                from openai.types.responses import ResponseTextDeltaEvent
+                if isinstance(event.data, ResponseTextDeltaEvent):
+                    report_text += event.data.delta
+                    yield report_text
+
+        # If nothing streamed (edge case), fall back to final output
+        if not report_text:
+            yield str(result.final_output)
+
+    except InputGuardrailTripwireTriggered:
+        yield (
+    "## 🚫 Request Blocked\n\n"
+    "**Sorry!!! I cannot answer any political questions.**\n\n"
+    "Please ask about non-political research topics such as companies, markets, or technology."
+    )
+    except Exception as e:
+        yield f"### Error\n\n{str(e)}"
